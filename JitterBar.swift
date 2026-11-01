@@ -23,8 +23,10 @@ import AppKit
 enum Pharma {
     /// Elimination half-life in healthy adults (hours).
     static let halfLifeHours = 5.0
-    /// Circadian sleep threshold (mg). Below this, REM sleep is biologically viable.
+    /// Below this amount of active caffeine (mg), sleep is unlikely to be disrupted.
     static let sleepThresholdMg = 40.0
+    /// Commonly cited safe daily intake for healthy adults (FDA / EFSA).
+    static let dailyLimitMg = 400.0
 
     /// Boer Formula for Lean Body Mass (LBM):
     /// LBM = 0.407 * W (kg) + 0.267 * H (cm) - 19.2
@@ -34,15 +36,35 @@ enum Pharma {
     }
 }
 
-struct Dose: Codable {
-    var timestamp: TimeInterval   // Unix epoch seconds
+/// A drink definition: a built-in preset or one the user saved.
+struct Drink: Codable, Equatable {
+    var name: String
     var mg: Double
+}
+
+struct Dose: Codable {
+    var timestamp: TimeInterval   // Unix epoch seconds (when it was drunk)
+    var mg: Double
+    var name: String?             // Optional for files written by older versions
 }
 
 struct LiverState: Codable {
     var heightCm: Double = 175.0
     var weightKg: Double = 75.0
     var doses: [Dose] = []
+    var savedDrinks: [Drink] = []
+
+    init() {}
+
+    /// Tolerates missing keys so older ~/.jitterbar.json files keep loading.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = LiverState()
+        heightCm    = try c.decodeIfPresent(Double.self, forKey: .heightCm) ?? defaults.heightCm
+        weightKg    = try c.decodeIfPresent(Double.self, forKey: .weightKg) ?? defaults.weightKg
+        doses       = try c.decodeIfPresent([Dose].self, forKey: .doses) ?? []
+        savedDrinks = try c.decodeIfPresent([Drink].self, forKey: .savedDrinks) ?? []
+    }
 }
 
 /// The metabolic engine. Persists to ~/.jitterbar.json.
@@ -71,12 +93,27 @@ final class Liver {
     func activeMg(at date: Date = Date()) -> Double {
         let now = date.timeIntervalSince1970
         return state.doses.reduce(0.0) { acc, d in
-            let hours = max(0.0, now - d.timestamp) / 3600.0
+            guard d.timestamp <= now else { return acc }
+            let hours = (now - d.timestamp) / 3600.0
             return acc + d.mg * pow(0.5, hours / Pharma.halfLifeHours)
         }
     }
 
-    /// Analytical circadian clearance: Δt = t½ · log₂(C(now) / 40.0)
+    /// Total caffeine logged since local midnight.
+    func todayMg(now: Date = Date()) -> Double {
+        todayDoses(now: now).reduce(0) { $0 + $1.dose.mg }
+    }
+
+    /// Today's doses with their index in `state.doses`, oldest first.
+    func todayDoses(now: Date = Date()) -> [(index: Int, dose: Dose)] {
+        let start = Calendar.current.startOfDay(for: now).timeIntervalSince1970
+        return state.doses.enumerated()
+            .filter { $0.element.timestamp >= start }
+            .map { (index: $0.offset, dose: $0.element) }
+            .sorted { $0.dose.timestamp < $1.dose.timestamp }
+    }
+
+    /// Analytical clearance: Δt = t½ · log₂(C(now) / 40.0)
     func clearanceDate(from now: Date = Date()) -> Date? {
         Liver.clearance(forActiveMg: activeMg(at: now), from: now)
     }
@@ -87,8 +124,10 @@ final class Liver {
         return now.addingTimeInterval(hours * 3600.0)
     }
 
-    func inject(_ mg: Double) {
-        state.doses.append(Dose(timestamp: Date().timeIntervalSince1970, mg: mg))
+    /// Logs a drink. Doses are kept in the order they were entered so Undo
+    /// always removes the most recent entry, even if it was backdated.
+    func log(_ drink: Drink, at date: Date = Date()) {
+        state.doses.append(Dose(timestamp: date.timeIntervalSince1970, mg: drink.mg, name: drink.name))
         save()
     }
 
@@ -100,6 +139,12 @@ final class Liver {
         return d
     }
 
+    func removeDose(at index: Int) {
+        guard state.doses.indices.contains(index) else { return }
+        state.doses.remove(at: index)
+        save()
+    }
+
     func flush() {
         state.doses.removeAll()
         save()
@@ -108,6 +153,22 @@ final class Liver {
     func calibrate(heightCm: Double, weightKg: Double) {
         state.heightCm = heightCm
         state.weightKg = weightKg
+        save()
+    }
+
+    /// Saves (or updates, matched by name) a drink shown in the main menu.
+    func saveDrink(_ drink: Drink) {
+        if let i = state.savedDrinks.firstIndex(where: { $0.name.caseInsensitiveCompare(drink.name) == .orderedSame }) {
+            state.savedDrinks[i] = drink
+        } else {
+            state.savedDrinks.append(drink)
+        }
+        save()
+    }
+
+    func removeSavedDrink(at index: Int) {
+        guard state.savedDrinks.indices.contains(index) else { return }
+        state.savedDrinks.remove(at: index)
         save()
     }
 
@@ -133,53 +194,88 @@ final class Liver {
 
 struct Stage {
     let name: String
-    let blurb: String
+    let detail: String
     let fps: Double
-    let gaugeColor: NSColor
+    let color: NSColor
+    /// Lower bound of this stage, in mg of active caffeine per kg of lean body mass.
+    let lowerBound: Double
     let previewIntensity: Double
 
+    /// Intensity at which the gauge is full.
+    static let gaugeMax = 6.0
+
     static let all: [Stage] = [
-        Stage(name: "Clinical Coma / Decaffeinated Husk",
-              blurb: "Bloodstream contains only water and mild existential dread. System idling.",
-              fps: 1.0, gaugeColor: .systemGray, previewIntensity: 0.15),
-        Stage(name: "Functional Member of Society",
-              blurb: "Cognitive baseline achieved. You can safely make eye contact with coworkers.",
-              fps: 3.0, gaugeColor: .systemGreen, previewIntensity: 0.9),
-        Stage(name: "10x Engineer / Unwarranted Confidence",
-              blurb: "Peak velocity. Dangerously close to rewriting the backend in Rust on a Friday afternoon.",
-              fps: 6.0, gaugeColor: .systemYellow, previewIntensity: 2.25),
-        Stage(name: "Tachycardia Simulator (Jitter Mode)",
-              blurb: "You can hear colors and taste keyboard switches. Resting heart rate has entered orbit.",
-              fps: 12.0, gaugeColor: .systemOrange, previewIntensity: 4.0),
-        Stage(name: "Interdimensional Rift / Kernel Panic",
-              blurb: "WARNING: Temporal causality compromised. Step away from the terminal and drink water immediately.",
-              fps: 20.0, gaugeColor: .systemRed, previewIntensity: 6.66),
+        Stage(name: "Decaffeinated", detail: "Little to no caffeine left in your system.",
+              fps: 1.0, color: .systemGray, lowerBound: 0.0, previewIntensity: 0.15),
+        Stage(name: "Alert", detail: "Awake and steady. A good baseline.",
+              fps: 3.0, color: .systemGreen, lowerBound: 0.3, previewIntensity: 0.9),
+        Stage(name: "Focused", detail: "Peak focus. A good window for hard problems.",
+              fps: 6.0, color: .systemYellow, lowerBound: 1.5, previewIntensity: 2.25),
+        Stage(name: "Jittery", detail: "Past the sweet spot. Maybe skip the next cup.",
+              fps: 12.0, color: .systemOrange, lowerBound: 3.0, previewIntensity: 4.0),
+        Stage(name: "Overloaded", detail: "Too much caffeine. Drink some water and take a break.",
+              fps: 20.0, color: .systemRed, lowerBound: 5.0, previewIntensity: 6.66),
     ]
 
     static func index(forIntensity r: Double) -> Int {
-        switch r {
-        case ..<0.3: return 0
-        case ..<1.5: return 1
-        case ..<3.0: return 2
-        case ..<5.0: return 3
-        default:     return 4
-        }
+        all.lastIndex { r >= $0.lowerBound } ?? 0
     }
 }
 
-struct Beverage {
-    let icon: String
-    let name: String
-    let mg: Double
-    let tagline: String
-
-    static let menu: [Beverage] = [
-        Beverage(icon: "☕",   name: "Single Espresso",  mg: 63,  tagline: "Warm up the compiler"),
-        Beverage(icon: "☕☕", name: "Double Espresso",  mg: 125, tagline: "Overclock the central nervous system"),
-        Beverage(icon: "🫖",  name: "V60 / Pour-Over",  mg: 150, tagline: "Artisanal palpitations"),
-        Beverage(icon: "🧊",  name: "Cold Brew",        mg: 200, tagline: "Liquid panic attack"),
-        Beverage(icon: "🍵",  name: "Black Tea",        mg: 45,  tagline: "Gentle micro-dose"),
+/// Built-in presets. Values are typical figures for a standard serving;
+/// cafés vary, so anything unusual can go in through "Custom Drink…".
+enum Drinks {
+    /// The most common orders, shown directly in the menu with ⌘1…⌘6.
+    static let popular: [Drink] = [
+        Drink(name: "Espresso", mg: 63),
+        Drink(name: "Double Espresso", mg: 126),
+        Drink(name: "Americano", mg: 126),
+        Drink(name: "Latte / Cappuccino / Flat White", mg: 126),
+        Drink(name: "Filter Coffee (350 ml)", mg: 140),
+        Drink(name: "Cold Brew (470 ml)", mg: 200),
     ]
+
+    /// Less common drinks, tucked into a submenu.
+    static let more: [(section: String, drinks: [Drink])] = [
+        ("Coffee", [
+            Drink(name: "Pour-Over / V60 (350 ml)", mg: 150),
+            Drink(name: "Instant Coffee", mg: 62),
+            Drink(name: "Iced Coffee (470 ml)", mg: 165),
+            Drink(name: "Decaf Coffee", mg: 3),
+        ]),
+        ("Tea", [
+            Drink(name: "Black Tea", mg: 47),
+            Drink(name: "Green Tea", mg: 28),
+            Drink(name: "Matcha Latte", mg: 70),
+        ]),
+        ("Other", [
+            Drink(name: "Energy Drink (250 ml)", mg: 80),
+            Drink(name: "Energy Drink (500 ml)", mg: 160),
+            Drink(name: "Cola (330 ml)", mg: 32),
+            Drink(name: "Caffeine Tablet", mg: 200),
+        ]),
+    ]
+}
+
+/// Locale-aware formatting (respects the user's 12/24-hour preference).
+enum Fmt {
+    private static let time: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f
+    }()
+    private static let dayTime: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("EEE jmm")
+        return f
+    }()
+
+    static func clock(_ date: Date, relativeTo now: Date = Date()) -> String {
+        Calendar.current.isDate(date, inSameDayAs: now) ? time.string(from: date) : dayTime.string(from: date)
+    }
+
+    static func mg(_ v: Double) -> String { "\(Int(v.rounded())) mg" }
 }
 
 // MARK: - Pixel Art & Sprite Sheet Engine --------------------------------------
@@ -215,7 +311,6 @@ iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAA
     static func loadMasterCGImage() -> CGImage {
         // 1. Try explicit / expected workspace file path
         let candidatePaths = [
-            "/Users/lava/bean/pixellab-A-16-bit-pixel-art-sprite-shee-1793572850083.png",
             Bundle.main.resourceURL?.appendingPathComponent("pixellab-A-16-bit-pixel-art-sprite-shee-1793572850083.png").path ?? "",
             FileManager.default.currentDirectoryPath + "/pixellab-A-16-bit-pixel-art-sprite-shee-1793572850083.png"
         ]
@@ -374,80 +469,155 @@ iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAA
     }
 }
 
-// MARK: - Telemetry Dropdown View ---------------------------------------------
+// MARK: - Dropdown Status Panel ------------------------------------------------
 
-final class TelemetryView: NSView {
+/// Segmented meter: one segment per stage, filled up to the current intensity.
+final class GaugeView: NSView {
+    var intensity: Double = 0 { didSet { needsDisplay = true } }
+    var color: NSColor = .systemGray { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let gap: CGFloat = 2
+        let h = bounds.height
+        let scale = bounds.width / CGFloat(Stage.gaugeMax)
+        let bounds_ = Stage.all.map { CGFloat($0.lowerBound) } + [CGFloat(Stage.gaugeMax)]
+        let fillX = CGFloat(min(intensity, Stage.gaugeMax)) * scale
+
+        for i in 0..<Stage.all.count {
+            let x0 = bounds_[i] * scale + (i == 0 ? 0 : gap / 2)
+            let x1 = bounds_[i + 1] * scale - (i == Stage.all.count - 1 ? 0 : gap / 2)
+            let seg = NSRect(x: x0, y: 0, width: max(0, x1 - x0), height: h)
+            let path = NSBezierPath(roundedRect: seg, xRadius: h / 2, yRadius: h / 2)
+            NSColor.quaternaryLabelColor.setFill()
+            path.fill()
+            if fillX > x0 {
+                NSGraphicsContext.saveGraphicsState()
+                path.addClip()
+                color.setFill()
+                NSRect(x: x0, y: 0, width: min(fillX, x1) - x0, height: h).fill()
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
+    }
+}
+
+final class StatusPanelView: NSView {
     override var isFlipped: Bool { true }
-    private let viewWidth: CGFloat = 380
+    static let width: CGFloat = 300
     private let inset: CGFloat = 14
 
-    private let stageLabel   = NSTextField(labelWithString: "")
-    private let blurbLabel   = NSTextField(wrappingLabelWithString: "")
-    private let metricsLabel = NSTextField(labelWithString: "")
-    private let gaugeLabel   = NSTextField(labelWithString: "")
-    private let sleepLabel   = NSTextField(wrappingLabelWithString: "")
-    private let calibLabel   = NSTextField(wrappingLabelWithString: "")
+    private let amountLabel = NSTextField(labelWithString: "")
+    private let stageLabel  = NSTextField(labelWithString: "")
+    private let gauge       = GaugeView()
+    private let detailLabel = NSTextField(wrappingLabelWithString: "")
+    private let sleepKey    = NSTextField(labelWithString: "Sleep-friendly")
+    private let sleepValue  = NSTextField(labelWithString: "")
+    private let todayKey    = NSTextField(labelWithString: "Today")
+    private let todayValue  = NSTextField(labelWithString: "")
+    private let footnote    = NSTextField(labelWithString: "")
     private let previewLabel = NSTextField(labelWithString: "")
 
     init() {
-        super.init(frame: NSRect(x: 0, y: 0, width: viewWidth, height: 120))
-        stageLabel.font = .boldSystemFont(ofSize: 13)
-        blurbLabel.font = NSFontManager.shared.convert(.systemFont(ofSize: 12), toHaveTrait: .italicFontMask)
-        blurbLabel.textColor = .secondaryLabelColor
-        metricsLabel.font = .monospacedSystemFont(ofSize: 11.5, weight: .medium)
-        gaugeLabel.font = .monospacedSystemFont(ofSize: 11.5, weight: .bold)
-        sleepLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        calibLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        calibLabel.textColor = .tertiaryLabelColor
-        previewLabel.font = .boldSystemFont(ofSize: 11)
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: 140))
+        stageLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        stageLabel.alignment = .right
+        detailLabel.font = .systemFont(ofSize: 12)
+        detailLabel.textColor = .secondaryLabelColor
+        for key in [sleepKey, todayKey] {
+            key.font = .systemFont(ofSize: 12)
+            key.textColor = .secondaryLabelColor
+        }
+        for value in [sleepValue, todayValue] {
+            value.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            value.alignment = .right
+        }
+        footnote.font = .systemFont(ofSize: 10.5)
+        footnote.textColor = .tertiaryLabelColor
+        previewLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         previewLabel.textColor = .systemPurple
-        [stageLabel, blurbLabel, metricsLabel, gaugeLabel, sleepLabel, calibLabel, previewLabel].forEach(addSubview)
+        [amountLabel, stageLabel, gauge, detailLabel, sleepKey, sleepValue,
+         todayKey, todayValue, footnote, previewLabel].forEach(addSubview)
     }
 
-    required init?(coder: NSCoder) { fatalError("Interface Builder is not a valid stimulant.") }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func update(stageIndex: Int, mg: Double, intensity: Double, clearance: Date?, preview: Bool,
-                heightCm: Double, weightKg: Double, lbm: Double, now: Date) {
+    func update(stageIndex: Int, mg: Double, intensity: Double, clearance: Date?, todayMg: Double,
+                preview: Bool, lbm: Double, now: Date) {
         let stage = Stage.all[stageIndex]
-        stageLabel.stringValue = "STAGE \(stageIndex) — \(stage.name)"
-        blurbLabel.stringValue = "“\(stage.blurb)”"
-        metricsLabel.stringValue = String(format: "Active: %.1f mg | Intensity: %.2f mg/kg (LBM)", mg, intensity)
 
-        let cells = 24
-        let filled = max(0, min(cells, Int((intensity / 6.0 * Double(cells)).rounded())))
-        gaugeLabel.stringValue = "Jitter ▕" + String(repeating: "█", count: filled)
-            + String(repeating: "░", count: cells - filled) + "▏" + (intensity >= 6 ? " ⚠︎" : "")
-        gaugeLabel.textColor = stage.gaugeColor
+        let amount = NSMutableAttributedString(string: "\(Int(mg.rounded()))", attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 24, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+        ])
+        amount.append(NSAttributedString(string: " mg active", attributes: [
+            .font: NSFont.systemFont(ofSize: 12),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]))
+        amountLabel.attributedStringValue = amount
 
-        sleepLabel.stringValue = "🌙 " + TelemetryView.sleepRadar(clearance, now: now)
-        calibLabel.stringValue = String(format: "Calibration: %.0f cm · %.1f kg → LBM %.1f kg (Boer) · t½ %.1f h",
-                                        heightCm, weightKg, lbm, Pharma.halfLifeHours)
-        previewLabel.stringValue = preview ? "🧪 TEST OVERDRIVE — Telemetry simulated. Liver is resting." : ""
+        stageLabel.stringValue = stage.name
+        stageLabel.textColor = stage.color
+        gauge.intensity = intensity
+        gauge.color = stage.color
+        detailLabel.stringValue = stage.detail
+
+        if let clearance = clearance {
+            sleepValue.stringValue = "after \(Fmt.clock(clearance, relativeTo: now))"
+            sleepValue.textColor = .labelColor
+        } else {
+            sleepValue.stringValue = "now"
+            sleepValue.textColor = .systemGreen
+        }
+
+        todayValue.stringValue = "\(Int(todayMg.rounded())) of \(Int(Pharma.dailyLimitMg)) mg"
+        todayValue.textColor = todayMg > Pharma.dailyLimitMg ? .systemOrange : .labelColor
+
+        footnote.stringValue = String(format: "%.1f mg/kg lean body mass  ·  %.0f h half-life", intensity, Pharma.halfLifeHours)
+        previewLabel.stringValue = preview ? "Preview — these are not your real levels" : ""
         relayout()
     }
 
-    static func sleepRadar(_ clearance: Date?, now: Date) -> String {
-        guard let clearance = clearance else { return "Sleep Clearance: Authorized." }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = Calendar.current.isDate(clearance, inSameDayAs: now) ? "hh:mm a" : "EEE hh:mm a"
-        return "Circadian Clearance: \(f.string(from: clearance)) (Good luck sleeping before then)."
-    }
-
     private func relayout() {
-        let w = viewWidth - inset * 2
-        var y: CGFloat = 8
-        let rows: [(NSTextField, CGFloat)] = [
-            (stageLabel, 2), (blurbLabel, 8), (metricsLabel, 4), (gaugeLabel, 8),
-            (sleepLabel, 6), (calibLabel, 3), (previewLabel, 0),
-        ]
-        for (label, gap) in rows {
-            if label.stringValue.isEmpty { label.frame = .zero; continue }
-            let h = ceil(label.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: w, height: 10_000)).height ?? 16)
-            label.frame = NSRect(x: inset, y: y, width: w, height: h)
-            y += h + gap
+        let w = Self.width - inset * 2
+        func height(_ l: NSTextField) -> CGFloat {
+            ceil(l.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: w, height: 10_000)).height ?? 16)
         }
-        setFrameSize(NSSize(width: viewWidth, height: y + 8))
+        var y: CGFloat = 6
+
+        if !previewLabel.stringValue.isEmpty {
+            let h = height(previewLabel)
+            previewLabel.frame = NSRect(x: inset, y: y, width: w, height: h)
+            y += h + 4
+        } else {
+            previewLabel.frame = .zero
+        }
+
+        let ah = height(amountLabel)
+        amountLabel.frame = NSRect(x: inset, y: y, width: w * 0.7, height: ah)
+        let sh = height(stageLabel)
+        stageLabel.frame = NSRect(x: inset + w * 0.5, y: y + ah - sh - 3, width: w * 0.5, height: sh)
+        y += ah + 6
+
+        gauge.frame = NSRect(x: inset, y: y, width: w, height: 6)
+        y += 6 + 8
+
+        let dh = height(detailLabel)
+        detailLabel.frame = NSRect(x: inset, y: y, width: w, height: dh)
+        y += dh + 10
+
+        for (key, value) in [(sleepKey, sleepValue), (todayKey, todayValue)] {
+            let rh = max(height(key), height(value))
+            key.frame = NSRect(x: inset, y: y, width: w / 2, height: rh)
+            value.frame = NSRect(x: inset + w / 2, y: y, width: w / 2, height: rh)
+            y += rh + 3
+        }
+        y += 5
+
+        let fh = height(footnote)
+        footnote.frame = NSRect(x: inset, y: y, width: w, height: fh)
+        y += fh + 6
+
+        setFrameSize(NSSize(width: Self.width, height: y))
     }
 }
 
@@ -465,14 +635,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private static let cycleSecondsPerStage = 2.5
     private static let fixedPreviewSeconds = 12.0
+    /// Right tab stop used to align caffeine amounts in drink menu items.
+    private static let amountTabStop: CGFloat = 250
 
     private let liver = Liver()
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
-    private let telemetry = TelemetryView()
-    private var telemetryItem: NSMenuItem!
-    private var undoItem: NSMenuItem!
-    private var endPreviewItem: NSMenuItem!
+    private let panel = StatusPanelView()
+    private lazy var panelItem: NSMenuItem = {
+        let item = NSMenuItem()
+        item.view = panel
+        return item
+    }()
 
     private var timer: Timer?
     private var timerFPS: Double = 0
@@ -480,7 +654,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastStage = -1
     private var lastTitle = ""
     private var menuOpen = false
-    private var lastTelemetryRefresh = Date.distantPast
+    private var lastPanelRefresh = Date.distantPast
     private var preview: Preview?
 
     /// 5 stages x 4 frames loaded and pre-rendered with nearest-neighbor scaling
@@ -492,86 +666,167 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.imagePosition = .imageLeft
             button.imageScaling = .scaleNone
         }
-        buildMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        rebuildMenu()
         statusItem.menu = menu
         tick()
 
         if liver.isFirstRun {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.calibrate(nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.editBodyProfile(nil) }
         }
     }
 
-    // MARK: Menu Setup
+    // MARK: Menu Construction
 
-    private func buildMenu() {
-        menu.delegate = self
-        menu.autoenablesItems = false
-
-        telemetryItem = NSMenuItem()
-        telemetryItem.view = telemetry
-        menu.addItem(telemetryItem)
+    /// The menu is rebuilt each time it opens so that saved drinks,
+    /// the Undo title and today's log are always current.
+    private func rebuildMenu() {
+        menu.removeAllItems()
+        menu.addItem(panelItem)
         menu.addItem(.separator())
 
-        menu.addItem(sectionHeader("Quick-Inject Beverage"))
-        for (i, bev) in Beverage.menu.enumerated() {
-            let item = NSMenuItem(title: "\(bev.icon) \(bev.name) (\(Int(bev.mg)) mg)",
-                                  action: #selector(inject(_:)), keyEquivalent: i < 9 ? "\(i + 1)" : "")
-            item.target = self
-            item.tag = i
-            let title = NSMutableAttributedString(string: "\(bev.icon) \(bev.name) (\(Int(bev.mg)) mg)\n",
-                                                  attributes: [.font: NSFont.menuFont(ofSize: 0)])
-            title.append(NSAttributedString(string: "“\(bev.tagline)”", attributes: [
-                .font: NSFontManager.shared.convert(.systemFont(ofSize: 11), toHaveTrait: .italicFontMask),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ]))
-            item.attributedTitle = title
-            menu.addItem(item)
+        // Drinks
+        menu.addItem(sectionHeader("Add Drink"))
+        for (i, drink) in Drinks.popular.enumerated() {
+            menu.addItem(drinkItem(drink, key: i < 9 ? "\(i + 1)" : ""))
         }
+        for drink in liver.state.savedDrinks {
+            menu.addItem(drinkItem(drink))
+        }
+        menu.addItem(moreDrinksItem())
+        menu.addItem(actionItem("Custom Drink…", #selector(addCustomDrink(_:)), key: "n"))
+
+        // History
+        menu.addItem(.separator())
+        let undo: NSMenuItem
+        if let last = liver.state.doses.last {
+            undo = actionItem("Undo \(last.name ?? "Drink") (\(Fmt.mg(last.mg)))", #selector(undoLast(_:)), key: "z")
+        } else {
+            undo = actionItem("Undo", #selector(undoLast(_:)), key: "z")
+            undo.isEnabled = false
+        }
+        menu.addItem(undo)
+        menu.addItem(todayLogItem())
+
+        // Settings
+        menu.addItem(.separator())
+        menu.addItem(actionItem("Body Profile…", #selector(editBodyProfile(_:)), key: ","))
+        menu.addItem(previewItem())
+        let clear = actionItem("Clear All Drinks…", #selector(clearAll(_:)))
+        clear.isEnabled = !liver.state.doses.isEmpty
+        menu.addItem(clear)
 
         menu.addItem(.separator())
-        menu.addItem(sectionHeader("Biometrics & Emergency"))
+        menu.addItem(NSMenuItem(title: "Quit JitterBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
 
-        undoItem = NSMenuItem(title: "↩︎ Undo Last Dose", action: #selector(undo(_:)), keyEquivalent: "z")
-        undoItem.target = self
-        menu.addItem(undoItem)
+    private func actionItem(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        return item
+    }
 
-        let calib = NSMenuItem(title: "🧬 Biometric Calibration…", action: #selector(calibrate(_:)), keyEquivalent: ",")
-        calib.target = self
-        menu.addItem(calib)
+    /// "Drink name ........ 126 mg" with the amount right-aligned in a secondary color.
+    private func drinkItem(_ drink: Drink, key: String = "") -> NSMenuItem {
+        let item = actionItem(drink.name, #selector(addDrink(_:)), key: key)
+        item.representedObject = drink
+        item.attributedTitle = columns(drink.name, Fmt.mg(drink.mg))
+        return item
+    }
 
-        let flush = NSMenuItem(title: "🧹 Flush Liver (Reset All Caffeine)", action: #selector(flushLiver(_:)), keyEquivalent: "")
-        flush.target = self
-        menu.addItem(flush)
+    private func columns(_ left: String, _ right: String) -> NSAttributedString {
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .right, location: Self.amountTabStop)]
+        let s = NSMutableAttributedString(string: left, attributes: [
+            .font: NSFont.menuFont(ofSize: 0), .paragraphStyle: para,
+        ])
+        s.append(NSAttributedString(string: "\t" + right, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para,
+        ]))
+        return s
+    }
 
-        let test = NSMenuItem(title: "🧪 Test Overdrive (Stage Preview)", action: nil, keyEquivalent: "")
+    private func moreDrinksItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "More Drinks", action: nil, keyEquivalent: "")
         let sub = NSMenu()
         sub.autoenablesItems = false
-        let cycle = NSMenuItem(title: "Cycle Through All Stages (\(Int(Self.cycleSecondsPerStage * 5)) s)",
-                               action: #selector(previewCycle(_:)), keyEquivalent: "")
-        cycle.target = self
-        sub.addItem(cycle)
+        for (i, group) in Drinks.more.enumerated() {
+            if i > 0 { sub.addItem(.separator()) }
+            sub.addItem(sectionHeader(group.section))
+            group.drinks.forEach { sub.addItem(drinkItem($0)) }
+        }
+        if !liver.state.savedDrinks.isEmpty {
+            sub.addItem(.separator())
+            let remove = NSMenuItem(title: "Remove Saved Drink", action: nil, keyEquivalent: "")
+            let removeSub = NSMenu()
+            for (i, drink) in liver.state.savedDrinks.enumerated() {
+                let r = actionItem(drink.name, #selector(removeSavedDrink(_:)))
+                r.tag = i
+                removeSub.addItem(r)
+            }
+            remove.submenu = removeSub
+            sub.addItem(remove)
+        }
+        item.submenu = sub
+        return item
+    }
+
+    private func todayLogItem() -> NSMenuItem {
+        let today = liver.todayDoses()
+        let item = NSMenuItem(title: "Today's Drinks", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        if today.isEmpty {
+            let empty = NSMenuItem(title: "Nothing logged yet", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            sub.addItem(empty)
+        } else {
+            sub.addItem(sectionHeader("Click a drink to remove it"))
+            for entry in today {
+                let date = Date(timeIntervalSince1970: entry.dose.timestamp)
+                let r = actionItem("", #selector(removeDose(_:)))
+                r.attributedTitle = columns("\(Fmt.clock(date))   \(entry.dose.name ?? "Drink")", Fmt.mg(entry.dose.mg))
+                r.tag = entry.index
+                sub.addItem(r)
+            }
+            sub.addItem(.separator())
+            let total = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            total.attributedTitle = columns("Total", Fmt.mg(liver.todayMg()))
+            total.isEnabled = false
+            sub.addItem(total)
+        }
+        item.submenu = sub
+        return item
+    }
+
+    private func previewItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Preview Stages", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        sub.addItem(actionItem("Play All Stages", #selector(previewCycle(_:))))
         sub.addItem(.separator())
         for (i, stage) in Stage.all.enumerated() {
-            let item = NSMenuItem(title: "Stage \(i) — \(stage.name)", action: #selector(previewStage(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = i
-            sub.addItem(item)
+            let s = actionItem(stage.name, #selector(previewStage(_:)))
+            s.tag = i
+            sub.addItem(s)
         }
         sub.addItem(.separator())
-        endPreviewItem = NSMenuItem(title: "End Preview", action: #selector(endPreview(_:)), keyEquivalent: "")
-        endPreviewItem.target = self
-        sub.addItem(endPreviewItem)
-        test.submenu = sub
-        menu.addItem(test)
-
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit JitterBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        let stop = actionItem("Stop Preview", #selector(endPreview(_:)))
+        stop.isEnabled = (preview != nil)
+        sub.addItem(stop)
+        item.submenu = sub
+        return item
     }
 
     private func sectionHeader(_ title: String) -> NSMenuItem {
         if #available(macOS 14.0, *) { return NSMenuItem.sectionHeader(title: title) }
-        let item = NSMenuItem(title: title.uppercased(), action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
         item.isEnabled = false
         return item
     }
@@ -612,24 +867,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if snap.stage != lastStage {
             lastStage = snap.stage
             frameIndex = 0
-            lastTelemetryRefresh = .distantPast
+            lastPanelRefresh = .distantPast
         }
 
-        // Display current frame
         statusItem.button?.image = frames[snap.stage][frameIndex % PixelEngine.framesPerStage]
         frameIndex &+= 1
 
-        // Display crisp monospaced active caffeine readout
-        let title = String(format: " %.0f mg", snap.mg) + (snap.isPreview ? " 🧪" : "")
+        let title = " " + Fmt.mg(snap.mg)
         if title != lastTitle {
             lastTitle = title
             statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: snap.isPreview ? NSColor.systemPurple : NSColor.labelColor,
             ])
         }
+        statusItem.button?.toolTip = snap.isPreview ? "Previewing \(Stage.all[snap.stage].name)" : Stage.all[snap.stage].name
 
-        if menuOpen && now.timeIntervalSince(lastTelemetryRefresh) >= 0.5 {
-            refreshTelemetry(snap, now: now)
+        if menuOpen && now.timeIntervalSince(lastPanelRefresh) >= 0.5 {
+            refreshPanel(snap, now: now)
         }
 
         let fps = Stage.all[snap.stage].fps
@@ -645,31 +900,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = t
     }
 
-    private func refreshTelemetry(_ snap: Snapshot? = nil, now: Date = Date()) {
+    private func refreshPanel(_ snap: Snapshot? = nil, now: Date = Date()) {
         let s = snap ?? snapshot(now: now)
-        lastTelemetryRefresh = now
-        telemetry.update(stageIndex: s.stage, mg: s.mg, intensity: s.intensity, clearance: s.clearance,
-                         preview: s.isPreview, heightCm: liver.state.heightCm, weightKg: liver.state.weightKg,
-                         lbm: liver.leanBodyMassKg, now: now)
-        if let last = liver.state.doses.last {
-            let f = DateFormatter()
-            f.locale = Locale(identifier: "en_US_POSIX")
-            f.dateFormat = "hh:mm a"
-            let doseDate = Date(timeIntervalSince1970: last.timestamp)
-            undoItem.title = "↩︎ Undo Last Dose (\(Int(last.mg)) mg @ \(f.string(from: doseDate)))"
-            undoItem.isEnabled = true
-        } else {
-            undoItem.title = "↩︎ Undo Last Dose"
-            undoItem.isEnabled = false
-        }
-        endPreviewItem.isEnabled = (preview != nil)
+        lastPanelRefresh = now
+        panel.update(stageIndex: s.stage, mg: s.mg, intensity: s.intensity, clearance: s.clearance,
+                     todayMg: liver.todayMg(now: now), preview: s.isPreview,
+                     lbm: liver.leanBodyMassKg, now: now)
     }
 
     // MARK: NSMenuDelegate
 
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu()
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
-        refreshTelemetry()
+        refreshPanel()
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -678,18 +925,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: User Actions
 
-    @objc private func inject(_ sender: NSMenuItem) {
-        liver.inject(Beverage.menu[sender.tag].mg)
+    @objc private func addDrink(_ sender: NSMenuItem) {
+        guard let drink = sender.representedObject as? Drink else { return }
+        liver.log(drink)
         preview = nil
         tick()
     }
 
-    @objc private func undo(_ sender: Any?) {
+    @objc private func undoLast(_ sender: Any?) {
         liver.undoLast()
         tick()
     }
 
-    @objc private func flushLiver(_ sender: Any?) {
+    @objc private func removeDose(_ sender: NSMenuItem) {
+        liver.removeDose(at: sender.tag)
+        tick()
+    }
+
+    @objc private func removeSavedDrink(_ sender: NSMenuItem) {
+        liver.removeSavedDrink(at: sender.tag)
+    }
+
+    @objc private func clearAll(_ sender: Any?) {
+        activateApp()
+        let alert = NSAlert()
+        alert.messageText = "Clear all logged drinks?"
+        alert.informativeText = "Your active caffeine will reset to 0 mg. Saved drinks and your body profile are kept."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+        if #available(macOS 11.0, *) { alert.buttons[0].hasDestructiveAction = true }
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         liver.flush()
         preview = nil
         tick()
@@ -710,49 +976,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tick()
     }
 
-    @objc func calibrate(_ sender: Any?) {
+    // MARK: Dialogs
+
+    private func activateApp() {
         if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    private func formLabel(_ text: String) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.alignment = .right
+        return l
+    }
+
+    private func numberField(_ value: String, placeholder: String) -> NSTextField {
+        let f = NSTextField(string: value)
+        f.placeholderString = placeholder
+        f.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        return f
+    }
+
+    private func parseNumber(_ f: NSTextField) -> Double? {
+        Double(f.stringValue.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: "."))
+    }
+
+    private func formGrid(_ rows: [[NSView]]) -> NSGridView {
+        let grid = NSGridView(views: rows)
+        grid.rowSpacing = 8
+        grid.columnSpacing = 8
+        grid.rowAlignment = .firstBaseline
+        grid.column(at: 0).xPlacement = .trailing
+        grid.layoutSubtreeIfNeeded()
+        grid.frame = NSRect(origin: .zero, size: grid.fittingSize)
+        return grid
+    }
+
+    private func showError(_ title: String, _ text: String) {
+        let err = NSAlert()
+        err.messageText = title
+        err.informativeText = text
+        err.alertStyle = .warning
+        err.runModal()
+    }
+
+    @objc private func addCustomDrink(_ sender: Any?) {
+        activateApp()
 
         let alert = NSAlert()
-        alert.messageText = "Biometric Calibration"
-        alert.informativeText = "Lean Body Mass is calibrated via the Boer formula. "
-            + "Caffeine partitions into intracellular water, leaving adipose tissue blissfully untouched."
+        alert.messageText = "Custom Drink"
+        alert.informativeText = "Check the label or the café's website for the caffeine amount."
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 62))
-        func row(_ label: String, _ value: Double, y: CGFloat) -> NSTextField {
-            let l = NSTextField(labelWithString: label)
-            l.frame = NSRect(x: 0, y: y + 3, width: 110, height: 18)
-            let field = NSTextField(string: String(format: "%g", value))
-            field.frame = NSRect(x: 115, y: y, width: 140, height: 24)
-            field.placeholderString = label
-            container.addSubview(l)
-            container.addSubview(field)
-            return field
+        let mgField = numberField("", placeholder: "e.g. 95")
+        let nameField = numberField("", placeholder: "Optional")
+        let whenOptions: [(String, TimeInterval)] = [
+            ("Just now", 0), ("15 minutes ago", 15), ("30 minutes ago", 30),
+            ("1 hour ago", 60), ("2 hours ago", 120), ("3 hours ago", 180),
+        ]
+        let whenPopup = NSPopUpButton()
+        whenPopup.addItems(withTitles: whenOptions.map(\.0))
+        let saveBox = NSButton(checkboxWithTitle: "Add to menu for next time", target: nil, action: nil)
+
+        alert.accessoryView = formGrid([
+            [formLabel("Caffeine (mg):"), mgField],
+            [formLabel("Name:"), nameField],
+            [formLabel("When:"), whenPopup],
+            [NSGridCell.emptyContentView, saveBox],
+        ])
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = mgField
+        mgField.nextKeyView = nameField
+
+        while true {
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            guard let mg = parseNumber(mgField), (1...1000).contains(mg) else {
+                showError("Enter a caffeine amount", "Use a number between 1 and 1000 mg.")
+                continue
+            }
+            let typedName = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+            if saveBox.state == .on && typedName.isEmpty {
+                showError("Name the drink to save it", "Saved drinks appear in the menu by name.")
+                continue
+            }
+            let drink = Drink(name: typedName.isEmpty ? "Custom" : typedName, mg: mg)
+            let minutesAgo = whenOptions[max(0, whenPopup.indexOfSelectedItem)].1
+            liver.log(drink, at: Date().addingTimeInterval(-minutesAgo * 60))
+            if saveBox.state == .on { liver.saveDrink(drink) }
+            preview = nil
+            tick()
+            return
         }
-        let heightField = row("Height (cm)", liver.state.heightCm, y: 34)
-        let weightField = row("Weight (kg)", liver.state.weightKg, y: 2)
+    }
+
+    @objc func editBodyProfile(_ sender: Any?) {
+        activateApp()
+
+        let alert = NSAlert()
+        alert.messageText = "Body Profile"
+        alert.informativeText = "Caffeine spreads through lean body mass, so height and weight make "
+            + "the estimate more accurate. Stored only on this Mac."
+
+        let heightField = numberField(String(format: "%g", liver.state.heightCm), placeholder: "cm")
+        let weightField = numberField(String(format: "%g", liver.state.weightKg), placeholder: "kg")
         heightField.nextKeyView = weightField
-        alert.accessoryView = container
-        alert.addButton(withTitle: "Calibrate")
+        alert.accessoryView = formGrid([
+            [formLabel("Height (cm):"), heightField],
+            [formLabel("Weight (kg):"), weightField],
+        ])
+        alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = heightField
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        func parse(_ f: NSTextField) -> Double? {
-            Double(f.stringValue.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: "."))
-        }
-        guard let h = parse(heightField), let w = parse(weightField),
-              (100...250).contains(h), (30...300).contains(w) else {
-            let err = NSAlert()
-            err.messageText = "Calibration Rejected"
-            err.informativeText = "Expected 100–250 cm and 30–300 kg. Please enter biological dimensions."
-            err.alertStyle = .warning
-            err.runModal()
+        while true {
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            guard let h = parseNumber(heightField), let w = parseNumber(weightField),
+                  (100...250).contains(h), (30...300).contains(w) else {
+                showError("Check your measurements", "Height should be 100–250 cm and weight 30–300 kg.")
+                continue
+            }
+            liver.calibrate(heightCm: h, weightKg: w)
+            tick()
             return
         }
-        liver.calibrate(heightCm: h, weightKg: w)
-        tick()
     }
 }
 

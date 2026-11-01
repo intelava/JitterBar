@@ -1,87 +1,93 @@
-# ☕ JitterBar
+<p align="center">
+  <img src="ultra_sprite.png" alt="JitterBar pixel-art mug at its highest caffeine stage" width="256" />
+</p>
 
-> **Real-Time Pharmacokinetic Caffeine Monitor & Procedural Pixel Art for the macOS Menu Bar.**  
-> Zero external runtime dependencies. Strict nearest-neighbor Retina scaling. Zero mercy for your sleep schedule.
+<h1 align="center">JitterBar</h1>
 
 <p align="center">
-  <img src="all_stages_preview.png" alt="JitterBar 5 Stages x 4 Frames Contact Sheet" width="600" />
+  A caffeine tracker for the macOS menu bar.<br/>
+  It estimates how much caffeine is active in your body right now, and shows it as an animated pixel-art mug.
 </p>
 
 ---
 
-## What is JitterBar?
+## What it does
 
-Most macOS "Caffeine" apps are sleep-prevention utilities that call `caffeinate(8)` to keep your screen awake.  
-**JitterBar monitors human systemic caffeine pharmacokinetics in real time**, displaying your metabolic intoxication state through an animated 16×16 / 20×20 pt pixel-art mug directly in your menu bar.
+- **Live caffeine level.** The menu bar shows your active caffeine in mg, next to a 20×20 pt pixel-art mug that changes with your level.
+- **One-click logging.** The most common coffee orders sit at the top of the menu (⌘1–⌘6), with tea, energy drinks and other options under *More Drinks*.
+- **Custom drinks.** Enter any amount, optionally name it, backdate it ("30 minutes ago") and save it to the menu for next time.
+- **Sleep estimate.** Shows when your active caffeine will drop below 40 mg, a level that's unlikely to disturb sleep.
+- **Daily total.** Tracks today's intake against the commonly cited 400 mg/day limit for healthy adults.
 
-As your active caffeine to Lean Body Mass ratio changes, the status icon cycles across **5 physiological stages**, shifting animation frames, altering dynamic FPS (from 1 FPS to a violent 20 FPS kernel panic), and applying procedural coordinate jitter so the mug physically shakes in the macOS status bar.
+## The menu
 
----
+```
+ 142 mg active                         Focused
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Peak focus. A good window for hard problems.
+ Sleep-friendly                  after 1:45 AM
+ Today                           271 of 400 mg
+ 2.4 mg/kg lean body mass · 5 h half-life
+─────────────────────────────────────────────
+ Add Drink
+   Espresso                          63 mg  ⌘1
+   Double Espresso                  126 mg  ⌘2
+   Americano                        126 mg  ⌘3
+   Latte / Cappuccino / Flat White  126 mg  ⌘4
+   Filter Coffee (350 ml)           140 mg  ⌘5
+   Cold Brew (470 ml)               200 mg  ⌘6
+   <your saved drinks>
+   More Drinks                               ▸
+   Custom Drink…                            ⌘N
+─────────────────────────────────────────────
+ Undo Latte / Cappuccino (126 mg)           ⌘Z
+ Today's Drinks                              ▸
+─────────────────────────────────────────────
+ Body Profile…                              ⌘,
+ Preview Stages                              ▸
+ Clear All Drinks…
+─────────────────────────────────────────────
+ Quit JitterBar                             ⌘Q
+```
 
-## 1. The Pharmacokinetic Engine
+**More Drinks** includes pour-over, instant, iced and decaf coffee; black tea, green tea and matcha; energy drinks, cola and caffeine tablets. Preset amounts are typical values for a standard serving. Cafés vary, so use *Custom Drink…* when you know the exact amount.
 
-Dividing caffeine by total body weight is for amateurs. Caffeine is hydrophilic ($V_d \approx 0.6 - 0.7\text{ L/kg}$) and distributes predominantly across **intracellular water**, leaving adipose tissue unburdened.
+**Today's Drinks** lists everything logged since midnight. Click an entry to remove it.
 
-### Boer Formula (Lean Body Mass)
-$$LBM = 0.407 \cdot W + 0.267 \cdot H - 19.2$$
+## Stages
 
-Your Height ($cm$) and Weight ($kg$) are calibrated via the menu dropdown and persisted locally in `~/.jitterbar.json`.
+The mug animates faster as your caffeine level rises. Levels are measured in mg of active caffeine per kg of lean body mass.
 
-### Exponential Elimination Decay
-Every beverage logged carries an initial dose $C_i$ and epoch timestamp $t_i$. Systemic active caffeine is computed via half-life ($t_{1/2} = 5.0\text{ h}$):
+| Stage | mg/kg LBM | Animation | Mug |
+| :--- | :--- | :---: | :--- |
+| Decaffeinated | < 0.3 | 1 fps | Knocked over, snoozing |
+| Alert | 0.3 – 1.5 | 3 fps | Upright and steaming |
+| Focused | 1.5 – 3.0 | 6 fps | Sunglasses on |
+| Jittery | 3.0 – 5.0 | 12 fps | Wide-eyed, sweating, shaking |
+| Overloaded | 5.0+ | 20 fps | Laser eyes and lightning |
 
-$$C(t) = \sum C_i \cdot (0.5)^{\frac{t - t_i}{5.0}}$$
+Use *Preview Stages* in the menu to see each one without drinking anything.
 
-### The Sleep Radar
-Solving analytically for when active caffeine clears the clinical REM sleep threshold ($40\text{ mg}$):
+## How the estimate works
 
-$$\Delta t = 5.0 \cdot \log_2\left(\frac{C(t)}{40.0}\right)$$
+**Lean body mass.** Caffeine distributes through body water rather than fat, so JitterBar scales by lean body mass using the Boer formula. Set your height and weight under *Body Profile…*.
 
-The menu displays an exact circadian clearance clock:  
-`🌙 Circadian Clearance: 02:45 AM (Good luck sleeping before then).`  
-If already below $40\text{ mg}$, it authorizes sleep: `Sleep Clearance: Authorized.`
+$$LBM = 0.407 \cdot W_{kg} + 0.267 \cdot H_{cm} - 19.2$$
 
----
+**Elimination.** Each drink decays independently with a 5-hour half-life:
 
-## 2. Physiological Stages & Dynamic FPS
+$$C(t) = \sum_i C_i \cdot 0.5^{(t - t_i)/5}$$
 
-| Stage | Intensity ($mg/kg$ LBM) | FPS | Sprite Behavioral State | Status Text |
-| :--- | :--- | :---: | :--- | :--- |
-| **0** | `0.0 – 0.3` | **1** | **Clinical Coma / Decaffeinated Husk:** Knocked-over mug lying horizontally with floating cyan $z$'s. | *"Bloodstream contains only water and mild existential dread. System idling."* |
-| **1** | `0.3 – 1.5` | **3** | **Functional Member of Society:** Upright cheerful mug, blushing cheeks, rising sine-wave steam, blinking. | *"Cognitive baseline achieved. You can safely make eye contact with coworkers."* |
-| **2** | `1.5 – 3.0` | **6** | **10x Engineer / Unwarranted Confidence:** Pitch-black 8-bit "Deal With It" shades, smirk, sliding glare, corner sparkles. | *"Peak velocity. Dangerously close to rewriting the backend in Rust on a Friday afternoon."* |
-| **3** | `3.0 – 5.0` | **12** | **Tachycardia Simulator (Jitter Mode):** Wide bloodshot eyes, clenched teeth, flying sweat droplets, **procedural coordinate shake** ($\pm 1\text{px}$). | *"You can hear colors and taste keyboard switches. Resting heart rate has entered orbit."* |
-| **4** | `5.0+` | **20** | **Interdimensional Rift / Kernel Panic:** Alternating neon strobe, cyan/yellow electricity, eye laser beams, violent coordinate jitter. | *"WARNING: Temporal causality compromised. Step away from the terminal and drink water immediately."* |
+**Sleep estimate.** Solved analytically for when $C(t)$ falls to 40 mg:
 
----
+$$\Delta t = 5 \cdot \log_2\left(\frac{C(t)}{40}\right)$$
 
-## 3. Pixel Engine & Zero-Asset Architecture
+These are population averages. Your actual half-life can range from about 2 to 10 hours depending on genetics, medication, pregnancy and smoking. Treat the numbers as a guide, not medical advice.
 
-* **Nearest-Neighbor Scaling:** Built with strict `interpolationQuality = .none` and `imageInterpolation = .none`. Pixel art remains razor-sharp on both 1× and 2× Retina screens.
-* **Chroma-Key Magenta Purge:** AI-generated sprites often contain `#F904FA` fringe. The runtime loader filters out artifact halos while preserving eye lasers, electricity, and cup outlines.
-* **Self-Contained Fallback:** The sprite sheet is baked directly into the single Swift source as an embedded Base64 payload. If the external `.png` is absent or moved, the executable runs completely standalone with zero missing assets.
+## Install
 
----
+Requires macOS 12+ and the Xcode Command Line Tools (`swiftc`).
 
-## 4. Quick-Inject Beverage Menu
-
-Log standard doses with one click or keyboard shortcuts:
-* `☕ Single Espresso (63 mg)` — *"Warm up the compiler"*
-* `☕☕ Double Espresso (125 mg)` — *"Overclock the central nervous system"*
-* `🫖 V60 / Pour-Over (150 mg)` — *"Artisanal palpitations"*
-* `🧊 Cold Brew (200 mg)` — *"Liquid panic attack"*
-* `🍵 Black Tea (45 mg)` — *"Gentle micro-dose"*
-* `↩︎ Undo Last Dose` — Revert accidental clicks with timestamp history.
-* `🧹 Flush Liver` — Resets all logged doses.
-* `🧪 Test Overdrive` — Preview individual stages or cycle through all 5 stages.
-
----
-
-## 5. Build & Installation
-
-Requires macOS 12+ and Xcode Command Line Tools (`swiftc`).
-
-### Option A: Build and run as a dock-less `.app`
 ```bash
 git clone https://github.com/intelava/JitterBar.git
 cd JitterBar
@@ -89,20 +95,27 @@ cd JitterBar
 open JitterBar.app
 ```
 
-### Option B: Single-file direct compile
+Or compile the single file directly:
+
 ```bash
 swiftc -O -swift-version 5 JitterBar.swift -o JitterBar
 ./JitterBar &
 ```
 
-### Diagnostics & Sprite Sheet Export
-Export all 20 sliced frames and the dark-mode contact sheet:
+Data is stored locally in `~/.jitterbar.json`. Nothing leaves your Mac.
+
+## Pixel art
+
+- The sprite sheet (5 stages × 4 frames) is embedded in the source as Base64, so the binary runs with no external assets. If a `pixellab-*.png` sheet sits next to the app, it is used instead.
+- All scaling is nearest-neighbor, so the pixels stay sharp on Retina displays.
+- Leftover magenta chroma-key fringe from sprite generation is filtered out at load time.
+
+Export every frame plus a contact sheet:
+
 ```bash
 ./JitterBar --dump-sprites /tmp/jitterbar_sprites
 open /tmp/jitterbar_sprites/contact_sheet.png
 ```
-
----
 
 ## License
 

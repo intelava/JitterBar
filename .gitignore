@@ -1,0 +1,6 @@
+.DS_Store
+*.app
+/JitterBar
+/extracted_sprites
+/tmp
+*.b64
